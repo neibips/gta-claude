@@ -19,6 +19,7 @@ import { GameConfig } from '../config/GameConfig';
 import weaponConfigJson from '../config/WeaponConfig.json';
 import type { WeaponConfigEntry } from '../entities/Weapon';
 import type { Vehicle } from '../entities/Vehicle';
+import { NPC } from '../entities/NPC';
 
 export class Game {
   private engine: GameEngine | null = null;
@@ -241,7 +242,13 @@ export class Game {
       this.player!.root.position.y = GameConfig.player.capsule.height / 2;
     }
 
-    // Update NPC list
+    // Update NPC list — refresh crowd neighbors for separation steering.
+    if (this.spawn) {
+      NPC.neighbors = [
+        ...this.spawn.npcs.filter((n) => !n.isDead()),
+        ...this.spawn.police.filter((p) => !p.isDead()),
+      ];
+    }
     for (const n of this.spawn?.npcs ?? []) n.update(dt);
     if (this.spawn && this.police) this.police.update(this.spawn.police, dt);
     this.traffic?.update(dt);
@@ -254,7 +261,24 @@ export class Game {
         if (hit) {
           const dmg = hit.speed > 20 ? 9999 : hit.speed * 4;
           const killedByPlayer = hit.v === this.playerVehicle;
+          // Launch the body along the car's heading, scaled by speed.
+          const f = hit.v.forward();
+          const launch = Math.max(8, Math.min(28, hit.speed * 1.4));
+          n.queueDeathImpulse(new Vector3(f.x * launch, launch * 0.55, f.z * launch));
           n.takeDamage(dmg, killedByPlayer ? 'player' : 'world');
+        }
+      }
+      // Also check police — running over cops is a signature feature.
+      for (const p of this.spawn.police) {
+        if (p.isDead()) continue;
+        const hit = this.traffic.detectRunOver(p.position(), 1.0);
+        if (hit) {
+          const dmg = hit.speed > 20 ? 9999 : hit.speed * 4;
+          const f = hit.v.forward();
+          const launch = Math.max(8, Math.min(28, hit.speed * 1.4));
+          p.queueDeathImpulse(new Vector3(f.x * launch, launch * 0.55, f.z * launch));
+          const byPlayer = hit.v === this.playerVehicle;
+          p.takeDamage(dmg, byPlayer ? 'player' : 'world');
         }
       }
     }

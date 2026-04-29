@@ -188,14 +188,25 @@ export class Policeman implements DamageTarget {
   private toppleOver(): void {
     this.anim?.stopAll();
     if (this.body) {
-      this.body.setMassProperties({ mass: 70, inertia: new Vector3(2, 2, 2) });
+      // Heavier than NPCs → same desired velocity needs more impulse, and the
+      // ragdoll travels less per equivalent kick. Different feel on death.
+      this.body.setMassProperties({ mass: 90, inertia: new Vector3(3, 3, 3) });
+      const POLICE_MASS = 90;
+      // Police ragdoll responds with 0.7x velocity vs NPC for the same caller
+      // impulse — they're tougher and flop heavier rather than launching.
       const impulse =
-        this.pendingDeathImpulse ??
+        this.pendingDeathImpulse?.scale(POLICE_MASS * 0.7) ??
         (() => {
           const angle = Math.random() * Math.PI * 2;
-          return new Vector3(Math.cos(angle) * 8, 4, Math.sin(angle) * 8);
+          return new Vector3(Math.cos(angle) * 4 * POLICE_MASS, 3 * POLICE_MASS, Math.sin(angle) * 4 * POLICE_MASS);
         })();
-      this.body.applyImpulse(impulse, this.root.getAbsolutePosition());
+      const at = this.root.getAbsolutePosition().add(new Vector3(0, 0.6, 0));
+      this.body.applyImpulse(impulse, at);
+      this.body.setAngularVelocity(new Vector3(
+        (Math.random() - 0.5) * 8,
+        (Math.random() - 0.5) * 4,
+        (Math.random() - 0.5) * 8,
+      ));
       this.pendingDeathImpulse = null;
       return;
     }

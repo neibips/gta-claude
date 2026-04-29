@@ -24,9 +24,13 @@ import type { Skeleton } from '@babylonjs/core/Bones/skeleton';
 
 export type NPCState = 'WALKING' | 'FLEEING' | 'DEAD';
 
+type CrowdAgent = { id?: string; position(): Vector3; isDead(): boolean };
+
 let nextNPCId = 0;
 
 export class NPC implements DamageTarget {
+  /** Set externally each tick to all alive NPCs + police for separation steering. */
+  static neighbors: CrowdAgent[] = [];
   readonly id: string;
   readonly root: Mesh;
   hp = 50;
@@ -164,15 +168,23 @@ export class NPC implements DamageTarget {
   private toppleOver(): void {
     this.anim?.stopAll();
     if (this.body) {
-      // Unlock rotation so the corpse can ragdoll, then kick it.
-      this.body.setMassProperties({ mass: 60, inertia: new Vector3(2, 2, 2) });
+      // Lighter than police so NPCs fly farther per-impulse.
+      this.body.setMassProperties({ mass: 30, inertia: new Vector3(2, 2, 2) });
+      // Caller-supplied impulses are treated as ~m/s; scale by mass.
+      const NPC_MASS = 30;
       const impulse =
-        this.pendingDeathImpulse ??
+        this.pendingDeathImpulse?.scale(NPC_MASS) ??
         (() => {
           const angle = Math.random() * Math.PI * 2;
-          return new Vector3(Math.cos(angle) * 8, 4, Math.sin(angle) * 8);
+          return new Vector3(Math.cos(angle) * 6 * NPC_MASS, 4 * NPC_MASS, Math.sin(angle) * 6 * NPC_MASS);
         })();
-      this.body.applyImpulse(impulse, this.root.getAbsolutePosition());
+      const at = this.root.getAbsolutePosition().add(new Vector3(0, 0.6, 0));
+      this.body.applyImpulse(impulse, at);
+      this.body.setAngularVelocity(new Vector3(
+        (Math.random() - 0.5) * 12,
+        (Math.random() - 0.5) * 6,
+        (Math.random() - 0.5) * 12,
+      ));
       this.pendingDeathImpulse = null;
     } else {
       // Pure visual topple
@@ -224,8 +236,37 @@ export class NPC implements DamageTarget {
     const dir = target.subtract(this.root.position);
     dir.y = 0;
     const dlen = dir.length();
-    if (dlen > 1e-3) {
-      dir.scaleInPlace(1 / dlen);
+    if (dlen > 1e-3) dir.scaleInPlace(1 / dlen);
+
+    // Separation steering: push away from nearby agents so NPCs flow around
+    // each other instead of jamming up where waypoints meet.
+    const SEP_RADIUS = 1.8;
+    let sepX = 0, sepZ = 0, sepN = 0;
+    const px = this.root.position.x, pz = this.root.position.z;
+    for (const o of NPC.neighbors) {
+      if (o.isDead()) continue;
+      if (o.id === this.id) continue;
+      const op = o.position();
+      const dx = px - op.x, dz = pz - op.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < 1e-4 || d2 > SEP_RADIUS * SEP_RADIUS) continue;
+      const d = Math.sqrt(d2);
+      const w = (SEP_RADIUS - d) / SEP_RADIUS;
+      sepX += (dx / d) * w;
+      sepZ += (dz / d) * w;
+      sepN++;
+    }
+    if (sepN > 0) {
+      dir.x += sepX * 1.6;
+      dir.z += sepZ * 1.6;
+      const nl = Math.hypot(dir.x, dir.z);
+      if (nl > 1e-3) {
+        dir.x /= nl;
+        dir.z /= nl;
+      }
+    }
+
+    if (dlen > 1e-3 || sepN > 0) {
       if (this.body) {
         const v = this.body.getLinearVelocity();
         this.body.setLinearVelocity(new Vector3(dir.x * speed, v.y, dir.z * speed));

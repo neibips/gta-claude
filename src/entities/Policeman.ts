@@ -1,0 +1,316 @@
+import { Vector3, Quaternion } from '@babylonjs/core/Maths/math.vector';
+import { Ray } from '@babylonjs/core/Culling/ray';
+import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
+import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
+import { Color3 } from '@babylonjs/core/Maths/math.color';
+import { PhysicsAggregate } from '@babylonjs/core/Physics/v2/physicsAggregate';
+import { PhysicsShapeType } from '@babylonjs/core/Physics/v2/IPhysicsEnginePlugin';
+import type { PhysicsBody } from '@babylonjs/core/Physics/v2/physicsBody';
+import type { Scene } from '@babylonjs/core/scene';
+import type { Mesh } from '@babylonjs/core/Meshes/mesh';
+
+import { AssetLoader, ASSET_INDEX } from '../core/AssetLoader';
+import {
+  AnimController,
+  buildRetargetMap,
+  retargetAnimationGroup,
+  type AnimSet,
+} from '../systems/AnimationSystem';
+import { GameConfig } from '../config/GameConfig';
+import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh';
+import type { Skeleton } from '@babylonjs/core/Bones/skeleton';
+import type { TransformNode } from '@babylonjs/core/Meshes/transformNode';
+import type { CoverPoint } from '../world/CoverPointGenerator';
+import type { Player } from './Player';
+import type { DamageTarget } from '../systems/WeaponSystem';
+
+export type PoliceState =
+  | 'PATROL'
+  | 'SEARCH'
+  | 'CHASE'
+  | 'TAKE_COVER'
+  | 'FLANK'
+  | 'ATTACK'
+  | 'RETREAT'
+  | 'DEAD';
+
+let nextId = 0;
+
+export class Policeman implements DamageTarget {
+  readonly id: string;
+  readonly root: Mesh;
+  hp = GameConfig.police.hp;
+  state: PoliceState = 'PATROL';
+  private anim: AnimController | null = null;
+  private currentCover: CoverPoint | null = null;
+  private nextStateChangeAt = 0;
+  private nextShotAt = 0;
+  private moving = false;
+  private deadAt = 0;
+  diedAtMs = 0;
+  body: PhysicsBody | null = null;
+  private pendingDeathImpulse: Vector3 | null = null;
+
+  /** Set externally to allow Policeman to attack the player. */
+  onShootPlayer?: (dmg: number) => void;
+  onDeath?: (p: Policeman) => void;
+
+  constructor(
+    private readonly scene: Scene,
+    private readonly coverPoints: CoverPoint[],
+    private readonly player: Player
+  ) {
+    this.id = `police_${nextId++}`;
+    this.root = MeshBuilder.CreateBox(this.id, { width: 0.6, depth: 0.4, height: 1.7 }, scene);
+    const m = new StandardMaterial(`mat_${this.id}`, scene);
+    m.diffuseColor = new Color3(0.1, 0.18, 0.55);
+    this.root.material = m;
+    this.root.checkCollisions = true;
+    this.root.metadata = { kind: 'police', id: this.id };
+    this.root.rotationQuaternion = Quaternion.Identity();
+    this.tryEnablePhysics();
+  }
+
+  private tryEnablePhysics(): void {
+    if (!this.scene.getPhysicsEngine()) return;
+    try {
+      const agg = new PhysicsAggregate(
+        this.root,
+        PhysicsShapeType.BOX,
+        { mass: 70, friction: 0.6, restitution: 0 },
+        this.scene
+      );
+      const body = agg.body;
+      body.disablePreStep = false;
+      body.setMassProperties({ mass: 70, inertia: new Vector3(0, 0, 0) });
+      this.body = body;
+    } catch (e) {
+      console.warn('[Policeman] physics enable failed', e);
+    }
+  }
+
+  async loadVisual(loader: AssetLoader): Promise<void> {
+    try {
+      const rig = await loader.loadModel(ASSET_INDEX.policeman.rig);
+      rig.rootMesh.parent = this.root;
+      rig.rootMesh.position.set(0, -0.85, 0);
+      (this.root.material as StandardMaterial).alpha = 0;
+
+      const skeleton: Skeleton | null =
+        (rig.rootMesh as AbstractMesh).skeleton ??
+        rig.meshes.find((m) => (m as AbstractMesh).skeleton)?.skeleton ??
+        null;
+      const targetMap = buildRetargetMap(rig.rootMesh as unknown as TransformNode, skeleton);
+
+      const loadAnim = async (url: string, name: string) => {
+        try {
+          const container = await loader.loadContainer(url);
+          const src = container.animationGroups[0] ?? null;
+          const retargeted = src
+            ? retargetAnimationGroup(src, targetMap, this.scene, `${this.id}_${name}`)
+            : null;
+          container.dispose();
+          return retargeted;
+        } catch (e) {
+          console.warn(`[Policeman] anim load failed ${url}`, e);
+          return null;
+        }
+      };
+
+      const [walkA, runA] = await Promise.all([
+        loadAnim(ASSET_INDEX.policeman.walk, 'walk'),
+        loadAnim(ASSET_INDEX.policeman.run, 'run'),
+      ]);
+      const set: AnimSet = {};
+      if (walkA) set.walk = walkA;
+      if (runA) set.run = runA;
+      this.anim = new AnimController(set);
+      this.anim.play('walk');
+    } catch (e) {
+      console.warn('[Policeman] load failed', e);
+    }
+  }
+
+  spawn(at: Vector3): void {
+    this.root.position.set(at.x, 0.85, at.z);
+    if (this.body) this.body.setLinearVelocity(Vector3.Zero());
+  }
+
+  position(): Vector3 {
+    return this.root.position;
+  }
+  isDead(): boolean {
+    return this.state === 'DEAD';
+  }
+  takeDamage(amount: number, source: 'player' | 'police' | 'world'): void {
+    if (this.state === 'DEAD') return;
+    this.hp -= amount;
+    if (this.hp <= 0) {
+      this.state = 'DEAD';
+      this.deadAt = performance.now();
+      this.diedAtMs = this.deadAt;
+      this.onDeath?.(this);
+      this.toppleOver();
+    } else if (this.hp <= GameConfig.police.hp * 0.3) {
+      this.state = 'RETREAT';
+    }
+    void source;
+  }
+
+  queueDeathImpulse(impulse: Vector3): void {
+    this.pendingDeathImpulse = impulse.clone();
+  }
+
+  hasLineOfSight(): boolean {
+    const from = this.root.position.add(new Vector3(0, 1.5, 0));
+    const to = this.player.position().add(new Vector3(0, 1.2, 0));
+    const dir = to.subtract(from);
+    const dist = dir.length();
+    if (dist > GameConfig.police.losMaxRange) return false;
+    dir.scaleInPlace(1 / dist);
+    const ray = new Ray(from, dir, dist);
+    const hit = this.scene.pickWithRay(
+      ray,
+      (m) => {
+        const k = (m.metadata as { kind?: string } | null)?.kind;
+        // Buildings, trees and decorations block. Other police don't.
+        return k === 'building' || k === 'tree' || k === 'decoration';
+      }
+    );
+    return !hit?.pickedMesh;
+  }
+
+  setState(s: PoliceState): void {
+    this.state = s;
+    this.nextStateChangeAt = performance.now() + GameConfig.police.repositionIntervalMs;
+  }
+
+  private toppleOver(): void {
+    this.anim?.stopAll();
+    if (this.body) {
+      this.body.setMassProperties({ mass: 70, inertia: new Vector3(2, 2, 2) });
+      const impulse =
+        this.pendingDeathImpulse ??
+        (() => {
+          const angle = Math.random() * Math.PI * 2;
+          return new Vector3(Math.cos(angle) * 8, 4, Math.sin(angle) * 8);
+        })();
+      this.body.applyImpulse(impulse, this.root.getAbsolutePosition());
+      this.pendingDeathImpulse = null;
+      return;
+    }
+    const start = this.root.rotationQuaternion ?? Quaternion.Identity();
+    const end = Quaternion.RotationAxis(new Vector3(1, 0, 0), Math.PI / 2).multiply(start);
+    const t0 = performance.now();
+    const obs = this.scene.onBeforeRenderObservable.add(() => {
+      const t = Math.min(1, (performance.now() - t0) / 500);
+      this.root.rotationQuaternion = Quaternion.Slerp(start, end, t);
+      this.root.position.y = Math.max(0.2, 0.85 - t * 0.65);
+      if (t >= 1) this.scene.onBeforeRenderObservable.remove(obs);
+    });
+  }
+
+  pickCover(): CoverPoint | null {
+    let best: CoverPoint | null = null;
+    let bestScore = Infinity;
+    const playerPos = this.player.position();
+    for (const c of this.coverPoints) {
+      if (c.occupiedBy && c.occupiedBy !== this.id) continue;
+      // Cover is "good" if it's close to us AND close to player but not on top of player
+      const distToMe = Vector3.DistanceSquared(c.position, this.root.position);
+      const distToPlayer = Vector3.DistanceSquared(c.position, playerPos);
+      if (distToPlayer < 36) continue; // too close
+      const score = distToMe + distToPlayer * 0.4;
+      if (score < bestScore) {
+        bestScore = score;
+        best = c;
+      }
+    }
+    if (best) {
+      if (this.currentCover) this.currentCover.occupiedBy = null;
+      best.occupiedBy = this.id;
+      this.currentCover = best;
+    }
+    return best;
+  }
+
+  releaseCover(): void {
+    if (this.currentCover) {
+      this.currentCover.occupiedBy = null;
+      this.currentCover = null;
+    }
+  }
+
+  /** Returns true if reached. */
+  moveTo(target: Vector3, speed: number, dt: number): boolean {
+    const dir = target.subtract(this.root.position);
+    dir.y = 0;
+    const dist = dir.length();
+    if (dist < 0.6) {
+      this.moving = false;
+      if (this.body) {
+        const v = this.body.getLinearVelocity();
+        this.body.setLinearVelocity(new Vector3(0, v.y, 0));
+      }
+      return true;
+    }
+    dir.scaleInPlace(1 / dist);
+    if (this.body) {
+      const v = this.body.getLinearVelocity();
+      this.body.setLinearVelocity(new Vector3(dir.x * speed, v.y, dir.z * speed));
+    } else {
+      const step = Math.min(dist, speed * dt);
+      this.root.position.x += dir.x * step;
+      this.root.position.z += dir.z * step;
+    }
+    const yaw = Math.atan2(dir.x, dir.z);
+    const cur = this.root.rotationQuaternion ?? Quaternion.Identity();
+    const tgt = Quaternion.RotationAxis(Vector3.Up(), yaw);
+    this.root.rotationQuaternion = Quaternion.Slerp(cur, tgt, Math.min(1, dt * 8));
+    this.moving = true;
+    return false;
+  }
+
+  faceTarget(target: Vector3, dt: number): void {
+    const dir = target.subtract(this.root.position);
+    dir.y = 0;
+    if (dir.lengthSquared() < 1e-3) return;
+    dir.normalize();
+    const yaw = Math.atan2(dir.x, dir.z);
+    const cur = this.root.rotationQuaternion ?? Quaternion.Identity();
+    const tgt = Quaternion.RotationAxis(Vector3.Up(), yaw);
+    this.root.rotationQuaternion = Quaternion.Slerp(cur, tgt, Math.min(1, dt * 10));
+  }
+
+  canShoot(now: number): boolean {
+    return now >= this.nextShotAt && !this.moving;
+  }
+  scheduleNextShot(now: number): void {
+    this.nextShotAt = now + GameConfig.police.fireIntervalMs;
+  }
+
+  isStateExpired(now: number): boolean {
+    return now >= this.nextStateChangeAt;
+  }
+
+  refreshTimer(): void {
+    this.nextStateChangeAt = performance.now() + GameConfig.police.repositionIntervalMs;
+  }
+
+  playRunning(): void {
+    this.anim?.play('run');
+  }
+  playWalking(): void {
+    this.anim?.play('walk');
+  }
+  stopAnim(): void {
+    this.anim?.stopAll();
+  }
+
+  dispose(): void {
+    this.releaseCover();
+    this.body?.dispose();
+    this.body = null;
+    this.root.dispose();
+  }
+}

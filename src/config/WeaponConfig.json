@@ -1,0 +1,73 @@
+{
+  "weapons": [
+    {
+      "id": "fists",
+      "slot": 1,
+      "name": "Fists",
+      "assetPath": null,
+      "damage": 25,
+      "range": 1.5,
+      "fireRate": 2,
+      "magazineSize": 0,
+      "reloadTime": 0,
+      "boneName": "RightHand",
+      "positionOffset": { "x": 0, "y": 0, "z": 0 },
+      "rotationOffset": { "x": 0, "y": 0, "z": 0 },
+      "scale": 1.0,
+      "ammoType": "none",
+      "effects": ["punch_impact"],
+      "ammoType_": null
+    },
+    {
+      "id": "ak47",
+      "slot": 2,
+      "name": "AK-47",
+      "assetPath": "assets/gun/ak_47.glb",
+      "damage": 35,
+      "range": 80,
+      "fireRate": 10,
+      "magazineSize": 30,
+      "reloadTime": 2.5,
+      "boneName": "RightHand",
+      "positionOffset": { "x": 0.05, "y": -0.02, "z": 0.18 },
+      "rotationOffset": { "x": 0, "y": 1.5708, "z": 0 },
+      "scale": 1.0,
+      "ammoType": "rifle",
+      "effects": ["muzzle_flash", "tracer"]
+    },
+    {
+      "id": "rpg",
+      "slot": 3,
+      "name": "RPG",
+      "assetPath": "assets/gun/rpg.glb",
+      "damage": 200,
+      "range": 60,
+      "fireRate": 0.5,
+      "magazineSize": 1,
+      "reloadTime": 3.5,
+      "boneName": "RightHand",
+      "positionOffset": { "x": 0.08, "y": 0, "z": 0.4 },
+      "rotationOffset": { "x": 0, "y": 1.5708, "z": 0 },
+      "scale": 1.0,
+      "ammoType": "rocket",
+      "effects": ["explosion", "shockwave"]
+    },
+    {
+      "id": "water_gun",
+      "slot": 4,
+      "name": "Water Gun",
+      "assetPath": "assets/gun/water_gun.glb",
+      "damage": 5,
+      "range": 12,
+      "fireRate": 6,
+      "magazineSize": 100,
+      "reloadTime": 1.5,
+      "boneName": "RightHand",
+      "positionOffset": { "x": 0.05, "y": 0, "z": 0.15 },
+      "rotationOffset": { "x": 0, "y": 1.5708, "z": 0 },
+      "scale": 1.0,
+      "ammoType": "water",
+      "effects": ["water_stream", "slow"]
+    }
+  ]
+}

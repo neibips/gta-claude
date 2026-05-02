@@ -1,5 +1,5 @@
 import type { CityMapFile } from '../types/map';
-import { MapValidator } from './MapValidator';
+import { WorldMapValidator } from './WorldMapValidator';
 
 export const MAP_URL = 'assets/maps/city-map.json';
 
@@ -32,7 +32,7 @@ export class MapLoader {
     } catch {
       throw new MapLoadError(`Map file is not valid JSON: ${url}`);
     }
-    const issues = MapValidator.validate(json);
+    const issues = WorldMapValidator.validate(json);
     if (issues.length) {
       throw new MapLoadError(`Map validation failed:\n  - ${issues.join('\n  - ')}`);
     }

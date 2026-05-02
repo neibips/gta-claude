@@ -8,8 +8,15 @@ import { PhysicsShapeType } from '@babylonjs/core/Physics/v2/IPhysicsEnginePlugi
 import type { PhysicsBody } from '@babylonjs/core/Physics/v2/physicsBody';
 import type { Scene } from '@babylonjs/core/scene';
 import type { Mesh } from '@babylonjs/core/Meshes/mesh';
+import type { Bone } from '@babylonjs/core/Bones/bone';
+import type { Observer } from '@babylonjs/core/Misc/observable';
 
 import { AssetLoader, ASSET_INDEX } from '../core/AssetLoader';
+import {
+  attachWeaponModelToRightHand,
+  type WeaponAttachmentOffsets,
+  type WeaponConfigEntry,
+} from './Weapon';
 import {
   AnimController,
   buildRetargetMap,
@@ -23,6 +30,7 @@ import type { TransformNode } from '@babylonjs/core/Meshes/transformNode';
 import type { CoverPoint } from '../world/CoverPointGenerator';
 import type { Player } from './Player';
 import type { DamageTarget } from '../systems/WeaponSystem';
+import weaponConfigJson from '../config/WeaponConfig.json';
 
 export type PoliceState =
   | 'PATROL'
@@ -35,6 +43,16 @@ export type PoliceState =
   | 'DEAD';
 
 let nextId = 0;
+const STEP_PROBE_INTERVAL = 0.12;
+
+const akConfig = (weaponConfigJson as { weapons: WeaponConfigEntry[] }).weapons.find(
+  (w) => w.id === 'ak47'
+);
+const policeAkAttachment: WeaponAttachmentOffsets & { scale: number } = {
+  positionOffset: akConfig?.positionOffset ?? { x: 0.05, y: -0.02, z: 0.18 },
+  rotationOffset: akConfig?.rotationOffset ?? { x: 0, y: 1.5708, z: 0 },
+  scale: akConfig?.scale ?? 1,
+};
 
 export class Policeman implements DamageTarget {
   readonly id: string;
@@ -50,6 +68,13 @@ export class Policeman implements DamageTarget {
   diedAtMs = 0;
   body: PhysicsBody | null = null;
   private pendingDeathImpulse: Vector3 | null = null;
+  private rightHandBone: Bone | null = null;
+  private rightArmBone: Bone | null = null;
+  private weaponRoot: TransformNode | null = null;
+  private aiming = false;
+  private aimObs: Observer<Scene> | null = null;
+  private recoilUntil = 0;
+  private stepProbeCooldown = Math.random() * STEP_PROBE_INTERVAL;
 
   /** Set externally to allow Policeman to attack the player. */
   onShootPlayer?: (dmg: number) => void;
@@ -100,6 +125,37 @@ export class Policeman implements DamageTarget {
         (rig.rootMesh as AbstractMesh).skeleton ??
         rig.meshes.find((m) => (m as AbstractMesh).skeleton)?.skeleton ??
         null;
+
+      if (skeleton) {
+        const bones = skeleton.bones;
+        const isFinger = (n: string) => /thumb|index|middle|ring|pinky|finger/i.test(n);
+        this.rightHandBone =
+          bones.find((b) => /^(mixamorig:?)?RightHand$/i.test(b.name)) ??
+          bones.find((b) => /right.?hand|hand.?r|r_hand/i.test(b.name) && !isFinger(b.name)) ??
+          null;
+        this.rightArmBone =
+          bones.find((b) => /right.?(upper)?.?arm|upperarm.?r/i.test(b.name)) ??
+          bones.find((b) => /right.?shoulder|shoulder.?r/i.test(b.name)) ??
+          this.rightHandBone;
+      }
+
+      // Attach AK-47 model to the right hand so the policeman visibly carries it.
+      try {
+        const gun = await loader.loadModel(ASSET_INDEX.guns.ak47);
+        const gunRoot = gun.rootMesh as unknown as TransformNode;
+        gunRoot.scaling.scaleInPlace(policeAkAttachment.scale);
+        attachWeaponModelToRightHand(
+          gunRoot,
+          this.rightHandBone,
+          rig.rootMesh as unknown as TransformNode,
+          policeAkAttachment,
+          gunRoot.scaling.clone()
+        );
+        this.weaponRoot = gunRoot as unknown as TransformNode;
+      } catch (e) {
+        console.warn('[Policeman] failed to load AK-47', e);
+      }
+
       const targetMap = buildRetargetMap(rig.rootMesh as unknown as TransformNode, skeleton);
 
       const loadAnim = async (url: string, name: string) => {
@@ -132,7 +188,13 @@ export class Policeman implements DamageTarget {
   }
 
   spawn(at: Vector3): void {
-    this.root.position.set(at.x, 0.85, at.z);
+    const ray = new Ray(new Vector3(at.x, at.y + 50, at.z), new Vector3(0, -1, 0), 200);
+    const hit = this.scene.pickWithRay(ray, (m) => {
+      const k = (m.metadata as { kind?: string } | null)?.kind;
+      return k === 'road' || k === 'sidewalk' || k === 'building' || k === 'ground' || k === 'terrain';
+    });
+    const groundY = hit?.pickedPoint?.y ?? at.y;
+    this.root.position.set(at.x, groundY + 0.85 + 0.05, at.z);
     if (this.body) this.body.setLinearVelocity(Vector3.Zero());
   }
 
@@ -186,6 +248,7 @@ export class Policeman implements DamageTarget {
   }
 
   private toppleOver(): void {
+    this.setAiming(false);
     this.anim?.stopAll();
     if (this.body) {
       // Heavier than NPCs → same desired velocity needs more impulse, and the
@@ -267,6 +330,7 @@ export class Policeman implements DamageTarget {
     }
     dir.scaleInPlace(1 / dist);
     if (this.body) {
+      this.tryStepUp(dir.x, dir.z, dt);
       const v = this.body.getLinearVelocity();
       this.body.setLinearVelocity(new Vector3(dir.x * speed, v.y, dir.z * speed));
     } else {
@@ -309,16 +373,98 @@ export class Policeman implements DamageTarget {
   }
 
   playRunning(): void {
+    if (this.aiming) this.setAiming(false);
     this.anim?.play('run');
   }
   playWalking(): void {
+    if (this.aiming) this.setAiming(false);
     this.anim?.play('walk');
   }
   stopAnim(): void {
     this.anim?.stopAll();
   }
 
+  /**
+   * Aiming pose: stops walk/run animation and procedurally rotates the right
+   * arm forward so the cop visibly aims his rifle instead of running in place
+   * while shooting. `playShootRecoil` overlays a brief kick on top of this.
+   */
+  setAiming(on: boolean): void {
+    if (on === this.aiming) return;
+    this.aiming = on;
+    if (on) {
+      this.anim?.stopAll();
+      const armNode = (this.rightArmBone ?? this.rightHandBone)?.getTransformNode?.();
+      if (!armNode) return;
+      const baseRot = armNode.rotationQuaternion?.clone() ?? Quaternion.Identity();
+      this.aimObs = this.scene.onBeforeRenderObservable.add(() => {
+        if (!this.aiming) return;
+        const now = performance.now();
+        const recoilT = Math.max(0, (this.recoilUntil - now) / 120);
+        const recoil = Math.sin(Math.min(1, recoilT) * Math.PI) * 0.6;
+        const aim = Quaternion.RotationAxis(new Vector3(1, 0, 0), -1.1 - recoil);
+        armNode.rotationQuaternion = baseRot.multiply(aim);
+      });
+    } else if (this.aimObs) {
+      this.scene.onBeforeRenderObservable.remove(this.aimObs);
+      this.aimObs = null;
+    }
+  }
+
+  playShootRecoil(): void {
+    this.recoilUntil = performance.now() + 120;
+    this.spawnMuzzleFlash();
+  }
+
+  private spawnMuzzleFlash(): void {
+    const anchor = this.weaponRoot ?? (this.rightHandBone?.getTransformNode?.() as TransformNode | null);
+    if (!anchor) return;
+    const m = MeshBuilder.CreateSphere(`pmflash_${this.id}`, { diameter: 0.35 }, this.scene);
+    const fwd = this.root.forward.clone();
+    const base = (anchor as unknown as { getAbsolutePosition?: () => Vector3 }).getAbsolutePosition?.()
+      ?? this.root.position.add(new Vector3(0, 1.3, 0));
+    m.position = base.add(fwd.scale(0.5));
+    const mat = new StandardMaterial(`pmflashm_${this.id}`, this.scene);
+    mat.emissiveColor = new Color3(1, 0.85, 0.25);
+    mat.disableLighting = true;
+    m.material = mat;
+    setTimeout(() => m.dispose(), 50);
+  }
+
+  /** Step over short curbs while pathing. */
+  private tryStepUp(dirX: number, dirZ: number, dt: number): void {
+    if (!this.body) return;
+    this.stepProbeCooldown -= dt;
+    if (this.stepProbeCooldown > 0) return;
+    this.stepProbeCooldown = STEP_PROBE_INTERVAL;
+    const len = Math.hypot(dirX, dirZ);
+    if (len < 1e-3) return;
+    const STEP_HEIGHT = 0.45;
+    const probe = 0.55;
+    const nx = dirX / len;
+    const nz = dirZ / len;
+    const feetY = this.root.position.y - 0.85;
+    const above = new Vector3(
+      this.root.position.x + nx * probe,
+      feetY + STEP_HEIGHT + 0.4,
+      this.root.position.z + nz * probe
+    );
+    const ray = new Ray(above, new Vector3(0, -1, 0), STEP_HEIGHT + 0.5);
+    const hit = this.scene.pickWithRay(ray, (m) => {
+      const k = (m.metadata as { kind?: string } | null)?.kind;
+      return k === 'sidewalk' || k === 'road' || k === 'building' || k === 'ground' || k === 'terrain';
+    });
+    if (!hit?.pickedPoint) return;
+    const diff = hit.pickedPoint.y - feetY;
+    if (diff > 0.04 && diff < STEP_HEIGHT) {
+      this.root.position.y = hit.pickedPoint.y + 0.85 + 0.02;
+      const v = this.body.getLinearVelocity();
+      if (v.y < 0) this.body.setLinearVelocity(new Vector3(v.x, 0, v.z));
+    }
+  }
+
   dispose(): void {
+    this.setAiming(false);
     this.releaseCover();
     this.body?.dispose();
     this.body = null;

@@ -21,14 +21,14 @@ export class Crosshair {
       r.width = w;
       r.height = h;
       r.thickness = 0;
-      r.background = '#ffffffd0';
+      r.background = 'rgba(124, 252, 74, 0.85)';
       r.isHitTestVisible = false;
       return r;
     };
     const h = mk('14px', '2px');
     const v = mk('2px', '14px');
     const dot = mk('2px', '2px');
-    dot.background = '#ff5252e0';
+    dot.background = 'rgba(124, 252, 74, 1)';
     this.root.addControl(h);
     this.root.addControl(v);
     this.root.addControl(dot);

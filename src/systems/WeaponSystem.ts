@@ -47,7 +47,10 @@ export class WeaponSystem {
 
   async load(): Promise<void> {
     for (const w of this.weapons) await w.load(this.scene, this.loader);
-    this.equipSlot(1);
+    // Auto-equip AK-47 so the player visibly holds a gun on spawn.
+    // Falls back to fists if AK-47 didn't load.
+    const ak = this.weapons.find((w) => w.cfg.slot === 2);
+    this.equipSlot(ak?.meshRoot ? 2 : 1);
   }
 
   setTargets(t: DamageTarget[]): void {

@@ -13,6 +13,25 @@ export type WaypointGraphLite = {
   nodes: Map<string, WaypointNode>;
 };
 
+/** NPC-like blockers are soft targets: traffic may brake, but should not reverse away from them. */
+export function isNpcLikeBlocker(kind: string | null | undefined): boolean {
+  return kind === 'npc' || kind === 'police';
+}
+
+/** Static/world blockers and other cars should trigger unstuck reverse behavior. */
+export function shouldReverseForBlocker(kind: string | null | undefined): boolean {
+  return !isNpcLikeBlocker(kind);
+}
+
+/**
+ * The imported city GLB labels some street slabs as sidewalk/curb meshes, so
+ * traffic treats both road and sidewalk mesh kinds as valid physical street
+ * surfaces. Lane-center recovery still comes from traffic waypoints.
+ */
+export function isRoadSurface(kind: string | null | undefined): boolean {
+  return kind === 'road' || kind === 'sidewalk';
+}
+
 /** Pick a next waypoint biased away from `prevId` so the vehicle doesn't U-turn. */
 export function nextWaypoint(
   graph: WaypointGraphLite,

@@ -5,9 +5,11 @@ import { PhysicsShapeType } from '@babylonjs/core/Physics/v2/IPhysicsEnginePlugi
 import type { Scene } from '@babylonjs/core/scene';
 import type { Mesh } from '@babylonjs/core/Meshes/mesh';
 import type { CityMapFile, Vector3Like } from '../types/map';
+import type { AssetLoader } from '../core/AssetLoader';
 import { RoadBuilder } from './RoadBuilder';
 import { BuildingBuilder } from './BuildingBuilder';
 import { DecorationBuilder } from './DecorationBuilder';
+import { MapModelBuilder } from './MapModelBuilder';
 import { WaypointGraph } from './WaypointGraph';
 import { CoverPointGenerator, type CoverPoint } from './CoverPointGenerator';
 
@@ -33,27 +35,44 @@ const v = (p: Vector3Like) => new Vector3(p.x, p.y, p.z);
 
 export class MapBuilder {
   /**
-   * Builds the 3D scene for the city map. Strictly a builder over saved data
+   * Builds the 3D scene for the world map. Strictly a builder over saved data
    * — never generates new map content.
    */
-  static build(scene: Scene, map: CityMapFile, hasPhysics: boolean): BuiltMap {
-    const root = new TransformNode('city', scene);
+  static async build(
+    scene: Scene,
+    map: CityMapFile,
+    hasPhysics: boolean,
+    loader?: AssetLoader
+  ): Promise<BuiltMap> {
+    const root = new TransformNode('world', scene);
 
+    const mapModelMeshes = await MapModelBuilder.build(scene, root, map, loader, hasPhysics);
     const groundMeshes = RoadBuilder.build(scene, root, map);
-    const buildings = BuildingBuilder.build(scene, root, map);
-    const { trees, deco } = DecorationBuilder.build(scene, root, map);
+    const buildings = await BuildingBuilder.build(scene, root, map, loader, hasPhysics);
+    const { trees, deco } = await DecorationBuilder.build(scene, root, map, loader);
 
     if (hasPhysics) {
-      // Static ground (the wide green floor) for player/vehicle physics.
-      const ground = groundMeshes.find((m) => m.name === 'ground');
-      if (ground) {
-        new PhysicsAggregate(ground, PhysicsShapeType.BOX, { mass: 0, friction: 0.7, restitution: 0 }, scene);
+      // Static world surfaces for player/vehicle physics.
+      for (const mesh of groundMeshes) {
+        const kind = (mesh.metadata as { kind?: string } | null)?.kind;
+        const shape = (mesh.metadata as { physicsShape?: string } | null)?.physicsShape;
+        if (kind === 'ground' || kind === 'terrain' || kind === 'sidewalk') {
+          const type = shape === 'mesh' ? PhysicsShapeType.MESH : PhysicsShapeType.BOX;
+          new PhysicsAggregate(mesh, type, { mass: 0, friction: 0.7, restitution: 0 }, scene);
+        }
       }
       for (const b of buildings) {
+        if ((b.metadata as { exactModelCollider?: boolean } | null)?.exactModelCollider) continue;
         new PhysicsAggregate(b, PhysicsShapeType.BOX, { mass: 0, friction: 0.4, restitution: 0.05 }, scene);
       }
       for (const t of trees) {
         new PhysicsAggregate(t, PhysicsShapeType.CYLINDER, { mass: 0, friction: 0.4, restitution: 0.05 }, scene);
+      }
+      for (const d of deco) {
+        if (!d.checkCollisions) continue;
+        const meta = d.metadata as { collisionShape?: string } | null;
+        const shape = meta?.collisionShape === 'cylinder' ? PhysicsShapeType.CYLINDER : PhysicsShapeType.BOX;
+        new PhysicsAggregate(d, shape, { mass: 0, friction: 0.5, restitution: 0.03 }, scene);
       }
     }
 
@@ -66,7 +85,7 @@ export class MapBuilder {
       buildings,
       trees,
       decorations: deco,
-      groundMeshes,
+      groundMeshes: [...mapModelMeshes, ...groundMeshes],
       npcGraph,
       trafficGraph,
       coverPoints,

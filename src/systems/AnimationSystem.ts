@@ -4,7 +4,7 @@ import type { TransformNode } from '@babylonjs/core/Meshes/transformNode';
 import type { Skeleton } from '@babylonjs/core/Bones/skeleton';
 import type { Bone } from '@babylonjs/core/Bones/bone';
 
-export type AnimSet = Partial<Record<'idle' | 'walk' | 'run' | 'shoot' | 'punch' | 'hold_weapon' | 'death_fall' | 'hit_reaction', AnimationGroup>>;
+export type AnimSet = Partial<Record<'idle' | 'walk' | 'run' | 'shoot' | 'punch' | 'jump' | 'hold_weapon' | 'death_fall' | 'hit_reaction', AnimationGroup>>;
 
 export type RetargetTarget = TransformNode | Bone;
 
@@ -13,16 +13,27 @@ export type RetargetTarget = TransformNode | Bone;
  * Used to resolve animation targets when retargeting an AnimationGroup
  * loaded from a separate glb file onto a different rig.
  */
+/** Strip exporter-specific prefixes (Mixamo, Blender) so a `mixamorig:Hips`
+ * target binds to a `Hips` bone and vice versa. Used as a fallback key. */
+const stripRigPrefix = (n: string): string =>
+  n.replace(/^mixamorig[:_]?/i, '').replace(/^Armature\|/i, '');
+
 export function buildRetargetMap(
   visualRoot: TransformNode | null,
   skeleton: Skeleton | null
 ): Map<string, RetargetTarget> {
   const map = new Map<string, RetargetTarget>();
+  const addBoth = (name: string | undefined, node: RetargetTarget) => {
+    if (!name) return;
+    if (!map.has(name)) map.set(name, node);
+    const stripped = stripRigPrefix(name);
+    if (stripped !== name && !map.has(stripped)) map.set(stripped, node);
+  };
   if (visualRoot) {
     const stack: TransformNode[] = [visualRoot];
     while (stack.length) {
       const n = stack.pop()!;
-      if (n.name) map.set(n.name, n);
+      addBoth(n.name, n);
       const kids = n.getChildren?.() as TransformNode[] | undefined;
       if (kids) for (const k of kids) stack.push(k);
     }
@@ -30,8 +41,8 @@ export function buildRetargetMap(
   if (skeleton) {
     for (const b of skeleton.bones) {
       const linked = b.getTransformNode?.();
-      if (linked?.name && !map.has(linked.name)) map.set(linked.name, linked);
-      if (b.name && !map.has(b.name)) map.set(b.name, b);
+      if (linked) addBoth(linked.name, linked);
+      addBoth(b.name, b);
     }
   }
   return map;
@@ -56,12 +67,13 @@ export function retargetAnimationGroup(
   for (const ta of source.targetedAnimations) {
     const oldName = (ta.target as { name?: string } | null)?.name;
     if (!oldName) continue;
-    const tgt = targets.get(oldName);
+    const tgt = targets.get(oldName) ?? targets.get(stripRigPrefix(oldName));
     if (!tgt) continue;
     ng.addTargetedAnimation(ta.animation.clone(), tgt);
     bound++;
   }
   if (bound === 0) {
+    console.warn(`[retarget] ${newName}: no targets matched (source has ${source.targetedAnimations.length} channels)`);
     ng.dispose();
     return null;
   }
@@ -79,6 +91,13 @@ export class AnimController {
 
   has(name: keyof AnimSet): boolean {
     return !!this.anims[name];
+  }
+
+  durationMs(name: keyof AnimSet): number {
+    const a = this.anims[name];
+    if (!a) return 0;
+    const fps = 60;
+    return ((a.to - a.from) / fps) * 1000;
   }
 
   play(name: keyof AnimSet, loop = true): void {

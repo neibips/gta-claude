@@ -1,4 +1,5 @@
 import { Vector3, Quaternion } from '@babylonjs/core/Maths/math.vector';
+import { Ray } from '@babylonjs/core/Culling/ray';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
 import { Color3 } from '@babylonjs/core/Maths/math.color';
@@ -27,6 +28,7 @@ export type NPCState = 'WALKING' | 'FLEEING' | 'DEAD';
 type CrowdAgent = { id?: string; position(): Vector3; isDead(): boolean };
 
 let nextNPCId = 0;
+const STEP_PROBE_INTERVAL = 0.12;
 
 export class NPC implements DamageTarget {
   /** Set externally each tick to all alive NPCs + police for separation steering. */
@@ -43,6 +45,7 @@ export class NPC implements DamageTarget {
   private fleeFrom: Vector3 | null = null;
   private anim: AnimController | null = null;
   private deadAt = 0;
+  private stepProbeCooldown = Math.random() * STEP_PROBE_INTERVAL;
   /** when ragdoll-ish body should be cleaned up (set externally) */
   diedAtMs = 0;
   body: PhysicsBody | null = null;
@@ -125,7 +128,13 @@ export class NPC implements DamageTarget {
   }
 
   spawn(at: Vector3): void {
-    this.root.position.set(at.x, 0.85, at.z);
+    const ray = new Ray(new Vector3(at.x, at.y + 50, at.z), new Vector3(0, -1, 0), 200);
+    const hit = this.scene.pickWithRay(ray, (m) => {
+      const k = (m.metadata as { kind?: string } | null)?.kind;
+      return k === 'road' || k === 'sidewalk' || k === 'building' || k === 'ground' || k === 'terrain';
+    });
+    const groundY = hit?.pickedPoint?.y ?? at.y;
+    this.root.position.set(at.x, groundY + 0.85 + 0.05, at.z);
     if (this.body) this.body.setLinearVelocity(Vector3.Zero());
     this.currentWP = this.graph.nearest(this.root.position);
   }
@@ -268,6 +277,7 @@ export class NPC implements DamageTarget {
 
     if (dlen > 1e-3 || sepN > 0) {
       if (this.body) {
+        this.tryStepUp(dir.x, dir.z, dt);
         const v = this.body.getLinearVelocity();
         this.body.setLinearVelocity(new Vector3(dir.x * speed, v.y, dir.z * speed));
       } else {
@@ -296,6 +306,38 @@ export class NPC implements DamageTarget {
         this.state = 'WALKING';
         this.fleeFrom = null;
       }
+    }
+  }
+
+  /** Lift over short curbs ahead — same idea as Player.tryStepUp. */
+  private tryStepUp(dirX: number, dirZ: number, dt: number): void {
+    if (!this.body) return;
+    this.stepProbeCooldown -= dt;
+    if (this.stepProbeCooldown > 0) return;
+    this.stepProbeCooldown = STEP_PROBE_INTERVAL;
+    const len = Math.hypot(dirX, dirZ);
+    if (len < 1e-3) return;
+    const STEP_HEIGHT = 0.45;
+    const probe = 0.55;
+    const nx = dirX / len;
+    const nz = dirZ / len;
+    const feetY = this.root.position.y - 0.85;
+    const above = new Vector3(
+      this.root.position.x + nx * probe,
+      feetY + STEP_HEIGHT + 0.4,
+      this.root.position.z + nz * probe
+    );
+    const ray = new Ray(above, new Vector3(0, -1, 0), STEP_HEIGHT + 0.5);
+    const hit = this.scene.pickWithRay(ray, (m) => {
+      const k = (m.metadata as { kind?: string } | null)?.kind;
+      return k === 'sidewalk' || k === 'road' || k === 'building' || k === 'ground' || k === 'terrain';
+    });
+    if (!hit?.pickedPoint) return;
+    const diff = hit.pickedPoint.y - feetY;
+    if (diff > 0.04 && diff < STEP_HEIGHT) {
+      this.root.position.y = hit.pickedPoint.y + 0.85 + 0.02;
+      const v = this.body.getLinearVelocity();
+      if (v.y < 0) this.body.setLinearVelocity(new Vector3(v.x, 0, v.z));
     }
   }
 

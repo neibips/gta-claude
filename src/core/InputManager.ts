@@ -18,6 +18,7 @@ export class InputManager {
 
   private readonly onKeyDown = (e: KeyboardEvent) => {
     const k = e.code;
+    if (k === 'Space') e.preventDefault();
     if (!this.held.has(k)) {
       this.downListeners.forEach((fn) => fn(k));
     }

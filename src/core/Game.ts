@@ -9,12 +9,16 @@ import { MapLoader } from '../world/MapLoader';
 import { MapBuilder, type BuiltMap } from '../world/MapBuilder';
 import { Player } from '../entities/Player';
 import { WeaponSystem } from '../systems/WeaponSystem';
+import { AmmoPickupSystem } from '../systems/AmmoPickupSystem';
 import { SpawnManager } from '../systems/SpawnManager';
 import { PoliceAISystem } from '../systems/PoliceAISystem';
 import { TrafficSystem } from '../systems/TrafficSystem';
 import { WantedSystem } from '../systems/WantedSystem';
 import { HUD } from '../ui/HUD';
 import { StartScreen, type StartScreenHandle } from '../ui/StartScreen';
+import { RadioSystem } from '../audio/RadioSystem';
+import { RadioHUD } from '../ui/RadioHUD';
+import { PlaylistEditor } from '../ui/PlaylistEditor';
 import { GameConfig } from '../config/GameConfig';
 import weaponConfigJson from '../config/WeaponConfig.json';
 import type { WeaponConfigEntry } from '../entities/Weapon';
@@ -30,12 +34,16 @@ export class Game {
   private builtMap: BuiltMap | null = null;
   private player: Player | null = null;
   private weapons: WeaponSystem | null = null;
+  private ammoPickups: AmmoPickupSystem | null = null;
   private spawn: SpawnManager | null = null;
   private police: PoliceAISystem | null = null;
   private traffic: TrafficSystem | null = null;
   private wanted: WantedSystem | null = null;
   private hud: HUD | null = null;
   private startUI: StartScreenHandle | null = null;
+  private radio: RadioSystem | null = null;
+  private radioHUD: RadioHUD | null = null;
+  private playlistEditor: PlaylistEditor | null = null;
   private playerVehicle: Vehicle | null = null;
   private cleanups: Array<() => void> = [];
   private hudReady = false;
@@ -51,27 +59,35 @@ export class Game {
     this.input = new InputManager(this.canvas);
     this.loader = new AssetLoader(this.sceneMgr.scene);
 
-    this.startUI = StartScreen.mount(this.sceneMgr.scene, () => this.handlePlay());
+    this.radio = new RadioSystem();
+    this.playlistEditor = new PlaylistEditor(this.radio);
+    void this.radio.loadPlaylist();
+
+    this.startUI = StartScreen.mount(
+      this.sceneMgr.scene,
+      () => this.handlePlay(),
+      () => this.playlistEditor?.show(),
+    );
 
     // Begin loading flow.
     this.engine.startRenderLoop(() => this.sceneMgr!.scene.render());
 
     try {
-      this.startUI.setStatus('Loading map…');
+      this.startUI.setStatus('Загрузка карты…');
       this.startUI.setProgress(0.05);
       const map = await MapLoader.load();
 
-      this.startUI.setStatus('Initializing physics…');
+      this.startUI.setStatus('Инициализация физики…');
       this.startUI.setProgress(0.15);
       const hasPhysics = await this.physics.init(this.sceneMgr.scene);
 
-      this.startUI.setStatus('Building city…');
+      this.startUI.setStatus('Построение мира…');
       this.startUI.setProgress(0.35);
-      this.builtMap = MapBuilder.build(this.sceneMgr.scene, map, hasPhysics);
+      this.builtMap = await MapBuilder.build(this.sceneMgr.scene, map, hasPhysics, this.loader);
       const shadowGen = this.sceneMgr.shadowGen;
       for (const m of [...this.builtMap.buildings, ...this.builtMap.trees]) shadowGen.addShadowCaster(m);
 
-      this.startUI.setStatus('Loading player…');
+      this.startUI.setStatus('Загрузка игрока…');
       this.startUI.setProgress(0.55);
       this.player = new Player(this.sceneMgr.scene, this.input, this.canvas);
       this.player.setSpawn(this.builtMap.spawn.player);
@@ -80,10 +96,13 @@ export class Game {
       if (hasPhysics) this.player.enablePhysics();
       shadowGen.addShadowCaster(this.player.root);
 
-      this.startUI.setStatus('Loading weapons…');
+      this.startUI.setStatus('Загрузка оружия…');
       this.startUI.setProgress(0.75);
       this.weapons = new WeaponSystem(this.sceneMgr.scene, this.loader, this.player);
       await this.weapons.load();
+
+      this.ammoPickups = new AmmoPickupSystem(this.sceneMgr.scene, this.player, this.weapons);
+      this.ammoPickups.spawnAll(this.builtMap.npcGraph);
 
       this.wanted = new WantedSystem();
       this.spawn = new SpawnManager(
@@ -95,7 +114,7 @@ export class Game {
         this.player
       );
       this.spawn.prespawnAll();
-      this.police = new PoliceAISystem(this.sceneMgr.scene, this.player);
+      this.police = new PoliceAISystem(this.sceneMgr.scene, this.player, this.builtMap.npcGraph);
       this.traffic = new TrafficSystem(
         this.sceneMgr.scene,
         this.loader,
@@ -105,6 +124,7 @@ export class Game {
       this.traffic.ensureMin();
 
       this.hud = new HUD(this.sceneMgr.scene, (weaponConfigJson as { weapons: WeaponConfigEntry[] }).weapons);
+      this.radioHUD = new RadioHUD(this.radio!);
       this.cleanups.push(this.wanted.onChange((lvl) => {
         this.hud!.wanted.setLevel(lvl);
         this.spawn!.setDesiredPolice(this.wanted!.policeForLevel());
@@ -148,7 +168,7 @@ export class Game {
       // Input bindings
       this.cleanups.push(this.input.onKeyDownOnce((code) => this.onKeyDown(code)));
 
-      this.startUI.setStatus('Ready');
+      this.startUI.setStatus('Готово');
       this.startUI.setProgress(1);
       this.startUI.enablePlay(true);
       (window as unknown as { __gtaBootComplete?: boolean }).__gtaBootComplete = true;
@@ -177,7 +197,12 @@ export class Game {
     this.canvas.style.cursor = 'none';
     const requestLock = () => {
       if (document.pointerLockElement !== this.canvas) {
-        try { this.canvas.requestPointerLock(); } catch { /* ignore */ }
+        try {
+          const maybePromise = this.canvas.requestPointerLock() as unknown as Promise<void> | undefined;
+          maybePromise?.catch?.(() => {
+            // Pointer lock can be unavailable in automated/headless contexts.
+          });
+        } catch { /* ignore */ }
       }
     };
     requestLock();
@@ -196,6 +221,20 @@ export class Game {
     else if (code === 'Digit4') this.weapons?.equipSlot(4);
     else if (code === 'KeyE') this.tryEnterVehicle();
     else if (code === 'KeyF') this.tryExitVehicle();
+    else if (code === 'Space') this.player?.playJump();
+    else if (code === 'KeyQ' && this.playerVehicle) this.radio?.toggle();
+    else if (code === 'KeyN' && this.playerVehicle) this.radio?.next();
+    else if (code === 'KeyM') this.togglePlaylistEditor();
+  }
+
+  private togglePlaylistEditor(): void {
+    if (!this.playlistEditor) return;
+    if (this.playlistEditor.isVisible()) {
+      this.playlistEditor.hide();
+    } else {
+      if (document.pointerLockElement) document.exitPointerLock();
+      void this.playlistEditor.show();
+    }
   }
 
   private tryEnterVehicle(): void {
@@ -206,6 +245,8 @@ export class Game {
     this.traffic.takeOver(car);
     this.player.setVehicleMode(true);
     this.playerVehicle = car;
+    this.radioHUD?.show();
+    this.radio?.start();
   }
 
   private tryExitVehicle(): void {
@@ -217,6 +258,8 @@ export class Game {
     this.player.setVehicleMode(false);
     this.traffic.release(car);
     this.playerVehicle = null;
+    this.radio?.stop();
+    this.radioHUD?.hide();
   }
 
   private tick(): void {
@@ -226,6 +269,7 @@ export class Game {
     this.lastFrame = now;
 
     this.player?.update(dt);
+    this.ammoPickups?.update(dt);
     this.spawn?.step(dt * 1000);
     this.wireSpawnedRef?.();
 
@@ -236,7 +280,10 @@ export class Game {
       this.playerVehicle.applyDriverInput(throttle, brake, steer, dt);
       // Camera follow vehicle
       const cam = this.player!.camera as ArcRotateCamera;
-      cam.target = Vector3.Lerp(cam.target, this.playerVehicle.root.position, Math.min(1, dt * 8));
+      const cameraTarget = this.playerVehicle.root.position.add(
+        new Vector3(0, GameConfig.camera.heightOffset * 0.5, 0)
+      );
+      cam.target = Vector3.Lerp(cam.target, cameraTarget, Math.min(1, dt * 8));
       // Move player invisibly with car so position queries work
       this.player!.root.position.copyFrom(this.playerVehicle.root.position);
       this.player!.root.position.y = GameConfig.player.capsule.height / 2;
@@ -253,6 +300,7 @@ export class Game {
     if (this.spawn && this.police) this.police.update(this.spawn.police, dt);
     this.traffic?.update(dt);
     this.wanted?.update();
+    this.enforceWorldBounds();
 
     // Run-over detection: traffic vehicles hitting NPCs
     if (this.traffic && this.spawn) {
@@ -301,11 +349,44 @@ export class Game {
     }
   }
 
+  private enforceWorldBounds(): void {
+    if (!this.player || !this.builtMap) return;
+    if (this.player.state === 'dead') return;
+
+    const tracked = this.playerVehicle?.root.position ?? this.player.root.position;
+    const halfW = this.builtMap.size.width / 2 + GameConfig.world.boundaryMargin;
+    const halfH = this.builtMap.size.height / 2 + GameConfig.world.boundaryMargin;
+    const outside =
+      tracked.x < -halfW ||
+      tracked.x > halfW ||
+      tracked.z < -halfH ||
+      tracked.z > halfH;
+    const fallen = tracked.y < GameConfig.world.fallKillY;
+    if (!outside && !fallen) return;
+
+    if (this.playerVehicle && this.traffic) {
+      const car = this.playerVehicle;
+      car.speed = 0;
+      this.traffic.release(car);
+      this.playerVehicle = null;
+      this.player.root.position.copyFrom(tracked);
+      this.player.root.position.y = GameConfig.player.capsule.height / 2;
+      this.player.setVehicleMode(false);
+      this.radio?.stop();
+      this.radioHUD?.hide();
+    }
+    this.player.kill();
+  }
+
   stop(): void {
     this.running = false;
     for (const c of this.cleanups) c();
     this.cleanups = [];
+    this.ammoPickups?.dispose();
     this.hud?.dispose();
+    this.radioHUD?.dispose();
+    this.playlistEditor?.dispose();
+    this.radio?.dispose();
     this.engine?.dispose();
   }
 }

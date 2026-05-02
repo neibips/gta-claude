@@ -27,8 +27,61 @@ export type WeaponConfigEntry = {
   effects: string[];
 };
 
+export type WeaponAttachmentOffsets = Pick<
+  WeaponConfigEntry,
+  'positionOffset' | 'rotationOffset'
+>;
+
+const MIN_PARENT_SCALE = 1e-4;
+
+function inverseScaleComponent(value: number): number {
+  const abs = Math.abs(value);
+  return abs > MIN_PARENT_SCALE ? 1 / abs : 1;
+}
+
+function attachmentParentScale(parent: TransformNode): Vector3 {
+  parent.computeWorldMatrix(true);
+  return parent.absoluteScaling;
+}
+
+export function attachWeaponModelToRightHand(
+  root: TransformNode,
+  bone: Bone | null,
+  fallbackParent: TransformNode,
+  offsets: WeaponAttachmentOffsets,
+  baseScaling = root.scaling
+): void {
+  const linked = bone?.getTransformNode?.();
+  const parent = linked ?? fallbackParent;
+  const parentScale = attachmentParentScale(parent);
+  const invScale = new Vector3(
+    inverseScaleComponent(parentScale.x),
+    inverseScaleComponent(parentScale.y),
+    inverseScaleComponent(parentScale.z)
+  );
+
+  root.setEnabled(true);
+  root.parent = parent;
+  root.position.set(
+    offsets.positionOffset.x * invScale.x,
+    offsets.positionOffset.y * invScale.y,
+    offsets.positionOffset.z * invScale.z
+  );
+  root.scaling.set(
+    baseScaling.x * invScale.x,
+    baseScaling.y * invScale.y,
+    baseScaling.z * invScale.z
+  );
+  root.rotationQuaternion = Quaternion.RotationYawPitchRoll(
+    offsets.rotationOffset.y,
+    offsets.rotationOffset.x,
+    offsets.rotationOffset.z
+  );
+}
+
 export class Weapon {
   meshRoot: TransformNode | null = null;
+  private baseScaling: Vector3 | null = null;
   ammoInMag: number;
   totalAmmo: number;
   lastFireAt = 0;
@@ -48,12 +101,13 @@ export class Weapon {
       const root = m.rootMesh as unknown as TransformNode;
       this.meshRoot = root;
       root.setEnabled(false);
-      // Preserve sign of the GLB importer's RH→LH flip on each axis when applying
-      // weapon scale; overwriting with positive scale on all axes mirrors the model.
-      const sx = Math.sign(root.scaling.x) || 1;
-      const sy = Math.sign(root.scaling.y) || 1;
-      const sz = Math.sign(root.scaling.z) || 1;
-      root.scaling.set(sx * this.cfg.scale, sy * this.cfg.scale, sz * this.cfg.scale);
+      // Multiply, don't overwrite — overwriting throws away whatever scale the
+      // GLB importer applied (often the model's real units), which would make
+      // the weapon invisibly small or oversized.
+      root.scaling.x *= this.cfg.scale;
+      root.scaling.y *= this.cfg.scale;
+      root.scaling.z *= this.cfg.scale;
+      this.baseScaling = root.scaling.clone();
     } catch (e) {
       console.warn(`[Weapon] failed to load ${this.cfg.assetPath}`, e);
       const fb = MeshBuilder.CreateBox(`${this.cfg.id}_fb`, { width: 0.1, depth: 0.6, height: 0.15 }, scene);
@@ -61,32 +115,22 @@ export class Weapon {
       mat.diffuseColor = new Color3(0.2, 0.2, 0.2);
       fb.material = mat;
       fb.setEnabled(false);
+      fb.scaling.scaleInPlace(this.cfg.scale);
+      this.baseScaling = fb.scaling.clone();
       this.meshRoot = fb as unknown as TransformNode;
     }
   }
 
   attach(bone: Bone | null, parentMesh: AbstractMesh): void {
-    const root = this.meshRoot as unknown as Mesh | null;
+    const root = this.meshRoot;
     if (!root) return;
-    root.setEnabled(true);
-    // Prefer the bone's linked TransformNode (skinned glb path) — parenting to a
-    // node is more reliable than attachToBone when the imported root is a
-    // __root__ wrapper with non-identity scaling.
-    const linked = bone?.getTransformNode?.();
-    if (linked) {
-      root.parent = linked;
-    } else if (bone) {
-      root.attachToBone(bone, parentMesh);
-    } else {
-      root.parent = parentMesh;
-    }
-    root.position.set(this.cfg.positionOffset.x, this.cfg.positionOffset.y, this.cfg.positionOffset.z);
-    const rOff = Quaternion.RotationYawPitchRoll(
-      this.cfg.rotationOffset.y,
-      this.cfg.rotationOffset.x,
-      this.cfg.rotationOffset.z
+    attachWeaponModelToRightHand(
+      root,
+      bone,
+      parentMesh as unknown as TransformNode,
+      this.cfg,
+      this.baseScaling ?? root.scaling
     );
-    root.rotationQuaternion = rOff;
   }
 
   detach(): void {

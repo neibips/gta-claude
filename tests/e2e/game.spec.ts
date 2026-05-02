@@ -41,11 +41,16 @@ test.describe('GTA6 AI', () => {
     const resp = await respPromise;
     expect(resp.status()).toBe(200);
     const body = await resp.json();
-    expect(body.size).toEqual({ width: 200, height: 200 });
+    expect(body.version).toBe(2);
+    expect(body.size).toEqual({ width: 600, height: 600 });
+    expect(body.districts.map((d: { id: string }) => d.id).sort()).toEqual(['city', 'factory', 'field', 'village']);
+    expect(body.visualModel.modelPath).toBe('assets/maps/city_map.glb');
+    expect(body.visualModel.collision).toBe('mesh');
     expect(Array.isArray(body.roads)).toBe(true);
     expect(body.roads.length).toBeGreaterThan(0);
     expect(Array.isArray(body.buildings)).toBe(true);
-    expect(body.buildings.some((b: { type: string }) => b.type === 'police_station')).toBe(true);
+    expect(body.buildings.some((b: { type: string; tags?: string[] }) => b.type === 'police_station' && b.tags?.includes('edge-station'))).toBe(true);
+    expect(body.assetInstances.some((a: { modelPath?: string }) => a.modelPath?.startsWith('assets/environment/'))).toBe(true);
     expect(generatorCalls).toBe(0);
   });
 

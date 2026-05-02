@@ -1,5 +1,6 @@
 import { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera';
 import { Vector3, Quaternion } from '@babylonjs/core/Maths/math.vector';
+import { Ray } from '@babylonjs/core/Culling/ray';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
 import { Color3 } from '@babylonjs/core/Maths/math.color';
@@ -32,7 +33,13 @@ export class Player {
   visualRoot: TransformNode | null = null;
   rightHandBone: Bone | null = null;
   rightArmBone: Bone | null = null;
+  private leftUpLegNode: TransformNode | null = null;
+  private rightUpLegNode: TransformNode | null = null;
+  private leftLowerLegNode: TransformNode | null = null;
+  private rightLowerLegNode: TransformNode | null = null;
   private punching = false;
+  private jumping = false;
+  private lastJumpAt = 0;
   camera!: ArcRotateCamera;
   hp: number = GameConfig.player.hp;
   state: PlayerState = 'alive';
@@ -140,6 +147,21 @@ export class Player {
           bones.find((b) => /right.?(upper)?.?arm|upperarm.?r/i.test(b.name)) ??
           bones.find((b) => /right.?shoulder|shoulder.?r/i.test(b.name)) ??
           this.rightHandBone;
+
+        const findLegNode = (re: RegExp): TransformNode | null =>
+          bones.find((b) => re.test(b.name))?.getTransformNode?.() ?? null;
+        this.leftUpLegNode =
+          findLegNode(/^(mixamorig:?)?LeftUpLeg$/i) ??
+          findLegNode(/left.?up.?leg|upleg.?l|l.?upleg|thigh.?l|left.?thigh/i);
+        this.rightUpLegNode =
+          findLegNode(/^(mixamorig:?)?RightUpLeg$/i) ??
+          findLegNode(/right.?up.?leg|upleg.?r|r.?upleg|thigh.?r|right.?thigh/i);
+        this.leftLowerLegNode =
+          findLegNode(/^(mixamorig:?)?LeftLeg$/i) ??
+          findLegNode(/left.?(lower)?leg|leg.?l|shin.?l|left.?shin|calf.?l/i);
+        this.rightLowerLegNode =
+          findLegNode(/^(mixamorig:?)?RightLeg$/i) ??
+          findLegNode(/right.?(lower)?leg|leg.?r|shin.?r|right.?shin|calf.?r/i);
       }
     } else {
       const fb = MeshBuilder.CreateBox('player_fallback', { width: 0.6, depth: 0.4, height: 1.7 }, this.scene);
@@ -171,16 +193,20 @@ export class Player {
       }
     };
 
-    const [idleA, walkA, runA] = await Promise.all([
+    const [idleA, walkA, runA, punchA, jumpA] = await Promise.all([
       loadAnim(ASSET_INDEX.player.idle, 'idle'),
       loadAnim(ASSET_INDEX.player.walk, 'walk'),
       loadAnim(ASSET_INDEX.player.run, 'run'),
+      loadAnim(ASSET_INDEX.player.punch, 'punch'),
+      loadAnim(ASSET_INDEX.player.jump, 'jump'),
     ]);
 
     const animSet: AnimSet = {};
     if (idleA) animSet.idle = idleA;
     if (walkA) animSet.walk = walkA;
     if (runA) animSet.run = runA;
+    if (punchA) animSet.punch = punchA;
+    if (jumpA) animSet.jump = jumpA;
     this.anim = new AnimController(animSet);
     this.anim.play('idle');
   }
@@ -194,10 +220,10 @@ export class Player {
       this.root.position.add(new Vector3(0, GameConfig.camera.heightOffset, 0)),
       this.scene
     );
-    cam.lowerRadiusLimit = 4;
-    cam.upperRadiusLimit = 14;
-    cam.lowerBetaLimit = 0.2;
-    cam.upperBetaLimit = Math.PI / 2 - 0.05;
+    cam.lowerRadiusLimit = GameConfig.camera.lowerRadiusLimit;
+    cam.upperRadiusLimit = GameConfig.camera.upperRadiusLimit;
+    cam.lowerBetaLimit = GameConfig.camera.lowerBetaLimit;
+    cam.upperBetaLimit = GameConfig.camera.upperBetaLimit;
     cam.wheelPrecision = GameConfig.camera.wheelPrecision;
     cam.inertia = GameConfig.camera.inertia;
     cam.angularSensibilityX = 1500;
@@ -217,8 +243,8 @@ export class Player {
       if (!this.camera) return;
       this.camera.alpha -= e.movementX * sensX;
       this.camera.beta -= e.movementY * sensY;
-      const lo = this.camera.lowerBetaLimit ?? 0.05;
-      const hi = this.camera.upperBetaLimit ?? Math.PI / 2 - 0.05;
+      const lo = this.camera.lowerBetaLimit ?? GameConfig.camera.lowerBetaLimit;
+      const hi = this.camera.upperBetaLimit ?? GameConfig.camera.upperBetaLimit;
       if (this.camera.beta < lo) this.camera.beta = lo;
       if (this.camera.beta > hi) this.camera.beta = hi;
     };
@@ -226,8 +252,8 @@ export class Player {
       if (document.pointerLockElement !== this.canvas) return;
       e.preventDefault();
       const delta = e.deltaY * 0.01;
-      const lo = this.camera.lowerRadiusLimit ?? 4;
-      const hi = this.camera.upperRadiusLimit ?? 14;
+      const lo = this.camera.lowerRadiusLimit ?? GameConfig.camera.lowerRadiusLimit;
+      const hi = this.camera.upperRadiusLimit ?? GameConfig.camera.upperRadiusLimit;
       this.camera.radius = Math.max(lo, Math.min(hi, this.camera.radius + delta));
     };
     document.addEventListener('mousemove', onMove);
@@ -257,13 +283,19 @@ export class Player {
   }
 
   /**
-   * Procedural punch: overlays an extra rotation on the right arm bone for
-   * ~350ms on top of whatever animation is playing (idle/walk). Uses
-   * onAfterAnimationsObservable so the additive twist runs after the main
-   * AnimController has written its keyframes for the frame.
+   * Plays the punch animation glb if available; falls back to a procedural
+   * arm-rotation overlay. Sets `punching` so update() doesn't override the
+   * one-shot animation by re-selecting idle/walk/run.
    */
   playPunch(): void {
     if (this.punching) return;
+    if (this.anim?.has('punch')) {
+      this.punching = true;
+      this.anim.play('punch', false);
+      const ms = Math.max(250, this.anim.durationMs('punch'));
+      setTimeout(() => { this.punching = false; }, ms);
+      return;
+    }
     const bone = this.rightArmBone ?? this.rightHandBone;
     const node = bone?.getTransformNode?.();
     if (!node) return;
@@ -277,8 +309,6 @@ export class Player {
         this.punching = false;
         return;
       }
-      // Sin curve: 0 → 1 → 0 over the duration. Rotate the arm forward (~80°)
-      // around the local X axis to fake a jab.
       const swing = Math.sin(t * Math.PI);
       const extra = Quaternion.RotationAxis(new Vector3(1, 0, 0), -swing * 1.4);
       const cur = node.rotationQuaternion ?? Quaternion.Identity();
@@ -286,9 +316,88 @@ export class Player {
     });
   }
 
+  /**
+   * Jump: plays the jump animation glb and applies a vertical impulse sized
+   * so the airborne flight time matches the animation. Falls back to a
+   * procedural leg-tuck overlay if the glb is unavailable.
+   *
+   * Velocity is derived from the physics gravity g and the airborne portion
+   * of the anim duration t_air via v = g * t_air / 2 (projectile motion),
+   * so landing aligns with the foot-plant frame regardless of anim length.
+   */
+  playJump(): void {
+    if (this.state !== 'alive') return;
+    if (this.jumping) return;
+    if (!this.body) return;
+    const now = performance.now();
+    if (now - this.lastJumpAt < GameConfig.jump.cooldownMs) return;
+    const v = this.body.getLinearVelocity();
+    if (Math.abs(v.y) > GameConfig.jump.groundedYVel) return;
+
+    const hasAnim = !!this.anim?.has('jump');
+    const animMs = hasAnim ? this.anim!.durationMs('jump') : 700;
+    const windupMs = animMs * GameConfig.jump.windupFraction;
+    const tAirSec = (animMs / 1000) * GameConfig.jump.airborneFraction;
+    const g = Math.abs(this.scene.getPhysicsEngine()?.gravity.y ?? -9.81);
+    const rawV = (g * tAirSec) / 2;
+    const jumpV = Math.min(
+      GameConfig.jump.maxVelocity,
+      Math.max(GameConfig.jump.minVelocity, rawV)
+    );
+    this.lastJumpAt = now;
+    this.jumping = true;
+
+    if (hasAnim) {
+      this.anim!.play('jump', false);
+      // Defer the physics impulse until the wind-up (crouch) frames have
+      // played. Without this, the body launches before the anim visibly
+      // starts and the airborne curve falls out of sync with the animation.
+      setTimeout(() => {
+        if (!this.body || this.state !== 'alive') return;
+        const cv = this.body.getLinearVelocity();
+        this.body.setLinearVelocity(new Vector3(cv.x, jumpV, cv.z));
+      }, windupMs);
+      setTimeout(() => { this.jumping = false; }, animMs);
+      return;
+    }
+
+    this.body.setLinearVelocity(new Vector3(v.x, jumpV, v.z));
+
+    const start = now;
+    const dur = animMs;
+    const apply = (n: TransformNode | null, ang: number) => {
+      if (!n) return;
+      const cur = n.rotationQuaternion ?? Quaternion.Identity();
+      n.rotationQuaternion = cur.multiply(
+        Quaternion.RotationAxis(new Vector3(1, 0, 0), ang)
+      );
+    };
+    const obs = this.scene.onAfterAnimationsObservable.add(() => {
+      const t = (performance.now() - start) / dur;
+      if (t >= 1 || this.state !== 'alive') {
+        this.scene.onAfterAnimationsObservable.remove(obs);
+        this.jumping = false;
+        return;
+      }
+      const tuck = t < 0.35
+        ? Math.sin((t / 0.35) * (Math.PI / 2))
+        : Math.cos(((t - 0.35) / 0.65) * (Math.PI / 2));
+      apply(this.leftUpLegNode, -tuck * 0.9);
+      apply(this.rightUpLegNode, -tuck * 0.9);
+      apply(this.leftLowerLegNode, tuck * 1.3);
+      apply(this.rightLowerLegNode, tuck * 1.3);
+    });
+  }
+
   setSpawn(p: Vector3): void {
-    this.spawn = p.clone();
-    this.spawn.y = GameConfig.player.capsule.height / 2;
+    // Snap to actual GLB ground at (x, z); the authored spawn y can be off.
+    const ray = new Ray(new Vector3(p.x, p.y + 50, p.z), new Vector3(0, -1, 0), 200);
+    const hit = this.scene.pickWithRay(ray, (m) => {
+      const k = (m.metadata as { kind?: string } | null)?.kind;
+      return k === 'road' || k === 'sidewalk' || k === 'building' || k === 'ground' || k === 'terrain';
+    });
+    const groundY = hit?.pickedPoint?.y ?? p.y;
+    this.spawn = new Vector3(p.x, groundY + GameConfig.player.capsule.height / 2 + 0.05, p.z);
     this.root.position.copyFrom(this.spawn);
     if (this.body) this.body.setLinearVelocity(Vector3.Zero());
   }
@@ -350,6 +459,7 @@ export class Player {
       const wz = right.z * nx + fwd.z * nz;
 
       if (this.body) {
+        this.tryStepUp(wx, wz);
         const v = this.body.getLinearVelocity();
         this.body.setLinearVelocity(new Vector3(wx * speed, v.y, wz * speed));
       } else {
@@ -376,10 +486,45 @@ export class Player {
     const target = this.root.position.add(new Vector3(0, GameConfig.camera.heightOffset * 0.5, 0));
     cam.target = Vector3.Lerp(cam.target, target, Math.min(1, dt * 8));
 
-    if (this.anim) {
+    if (this.anim && !this.punching && !this.jumping) {
       if (!this.moving) this.anim.play('idle');
       else if (this.running && this.anim.has('run')) this.anim.play('run');
       else this.anim.play('walk');
+    }
+  }
+
+  /**
+   * Step-up assist: probes the ground a short distance ahead and, if it sits
+   * higher than the capsule's feet but below `STEP_HEIGHT`, lifts the body so
+   * the capsule mounts the curb instead of running into its vertical face.
+   */
+  private tryStepUp(dirX: number, dirZ: number): void {
+    if (!this.body) return;
+    const len = Math.hypot(dirX, dirZ);
+    if (len < 1e-3) return;
+    const STEP_HEIGHT = 0.45;
+    const radius = GameConfig.player.capsule.radius;
+    const probe = radius + 0.25;
+    const nx = dirX / len;
+    const nz = dirZ / len;
+    const feetY = this.root.position.y - GameConfig.player.capsule.height / 2;
+    const above = new Vector3(
+      this.root.position.x + nx * probe,
+      feetY + STEP_HEIGHT + 0.4,
+      this.root.position.z + nz * probe
+    );
+    const ray = new Ray(above, new Vector3(0, -1, 0), STEP_HEIGHT + 0.5);
+    const hit = this.scene.pickWithRay(ray, (m) => {
+      const k = (m.metadata as { kind?: string } | null)?.kind;
+      return k === 'sidewalk' || k === 'road' || k === 'building' || k === 'ground' || k === 'terrain';
+    });
+    if (!hit?.pickedPoint) return;
+    const groundY = hit.pickedPoint.y;
+    const diff = groundY - feetY;
+    if (diff > 0.04 && diff < STEP_HEIGHT) {
+      this.root.position.y = groundY + GameConfig.player.capsule.height / 2 + 0.02;
+      const v = this.body.getLinearVelocity();
+      if (v.y < 0) this.body.setLinearVelocity(new Vector3(v.x, 0, v.z));
     }
   }
 

@@ -15,8 +15,25 @@ import { GameConfig } from '../config/GameConfig';
 let nextId = 0;
 
 export type VehicleMode = 'traffic' | 'player' | 'idle';
+export type VehicleRaycastHit = {
+  distance: number;
+  kind: string;
+  id: string | null;
+  point: Vector3;
+};
 
 const VEHICLE_HALF_HEIGHT = 0.7;
+const FORWARD_BLOCKER_KINDS = new Set([
+  'building',
+  'decoration',
+  'npc',
+  'player',
+  'police',
+  'sidewalk',
+  'tree',
+  'vehicle',
+]);
+const GROUND_PROBE_KINDS = new Set(['road', 'sidewalk', 'building', 'decoration', 'ground', 'terrain']);
 
 export class Vehicle {
   readonly id: string;
@@ -78,13 +95,28 @@ export class Vehicle {
   }
 
   spawn(at: Vector3, yaw = 0): void {
-    this.root.position.set(at.x, VEHICLE_HALF_HEIGHT, at.z);
+    // Snap onto the actual road surface — the GLB ground may sit higher than
+    // the authored waypoint y, otherwise cars spawn buried or floating.
+    const snappedY = this.snapToGroundY(at.x, at.z, at.y) + VEHICLE_HALF_HEIGHT;
+    this.root.position.set(at.x, snappedY, at.z);
     this.yaw = yaw;
     this.root.rotationQuaternion = Quaternion.RotationAxis(Vector3.Up(), yaw);
     if (this.body) {
       this.body.setLinearVelocity(Vector3.Zero());
       this.body.setAngularVelocity(Vector3.Zero());
     }
+  }
+
+  /** Find the road/ground Y at (x, z) by casting a ray downward from above. */
+  private snapToGroundY(x: number, z: number, fallback: number): number {
+    const origin = new Vector3(x, fallback + 50, z);
+    const ray = new Ray(origin, new Vector3(0, -1, 0), 200);
+    const hit = this.scene.pickWithRay(ray, (m) => {
+      const k = (m.metadata as { kind?: string } | null)?.kind;
+      return k === 'road' || k === 'sidewalk' || k === 'building' || k === 'ground' || k === 'terrain';
+    });
+    if (hit?.pickedPoint) return hit.pickedPoint.y;
+    return fallback;
   }
 
   setYaw(yaw: number): void {
@@ -96,20 +128,51 @@ export class Vehicle {
     return new Vector3(Math.sin(this.yaw), 0, Math.cos(this.yaw));
   }
 
-  /** Raycast forward; returns distance to nearest blocker (or Infinity). */
-  raycastForward(distance: number, ignoreId?: string): number {
+  /** Raycast forward; returns nearest blocker details or null. */
+  raycastForwardHit(distance: number, ignoreId?: string): VehicleRaycastHit | null {
     const f = this.forward();
     const origin = this.root.position.add(f.scale(2.2));
-    origin.y = VEHICLE_HALF_HEIGHT;
+    // Cast at the car's actual height; GLB roads can sit above y=0.
+    origin.y = this.root.position.y;
     const ray = new Ray(origin, f, distance);
     const hit = this.scene.pickWithRay(ray, (m) => {
       const k = (m.metadata as { kind?: string; id?: string } | null)?.kind;
       const id = (m.metadata as { id?: string } | null)?.id;
       if (id && id === ignoreId) return false;
-      return k === 'building' || k === 'vehicle' || k === 'npc' || k === 'police' || k === 'tree' || k === 'player';
+      return Boolean(k && FORWARD_BLOCKER_KINDS.has(k));
     });
-    if (hit?.pickedPoint) return Vector3.Distance(origin, hit.pickedPoint);
+    if (hit?.pickedPoint && hit.pickedMesh) {
+      const meta = hit.pickedMesh.metadata as { kind?: string; id?: string } | null;
+      return {
+        distance: Vector3.Distance(origin, hit.pickedPoint),
+        kind: meta?.kind ?? 'unknown',
+        id: meta?.id ?? null,
+        point: hit.pickedPoint.clone(),
+      };
+    }
+    return null;
+  }
+
+  /** Raycast forward; returns distance to nearest blocker (or Infinity). */
+  raycastForward(distance: number, ignoreId?: string): number {
+    const hit = this.raycastForwardHit(distance, ignoreId);
+    if (hit) return hit.distance;
     return Infinity;
+  }
+
+  /** Probe the surface kind below a point relative to the car. */
+  groundKindAt(offsetForward = 0, offsetRight = 0): string | null {
+    const f = this.forward();
+    const right = new Vector3(f.z, 0, -f.x);
+    const origin = this.root.position.add(f.scale(offsetForward)).add(right.scale(offsetRight));
+    origin.y = this.root.position.y + 20;
+    const ray = new Ray(origin, new Vector3(0, -1, 0), 80);
+    const hit = this.scene.pickWithRay(ray, (m) => {
+      const k = (m.metadata as { kind?: string } | null)?.kind;
+      return Boolean(k && GROUND_PROBE_KINDS.has(k));
+    });
+    if (!hit?.pickedMesh) return null;
+    return (hit.pickedMesh.metadata as { kind?: string } | null)?.kind ?? null;
   }
 
   /** Move forward with current speed. Uses physics velocity if available. */
@@ -117,8 +180,16 @@ export class Vehicle {
     const f = this.forward();
     if (this.body) {
       const v = this.body.getLinearVelocity();
-      this.body.setLinearVelocity(new Vector3(f.x * this.speed, v.y, f.z * this.speed));
-      // Damp out angular velocity from collisions; rotation is set via mesh.
+      // Clamp any vertical velocity from collisions to a tiny range so curb
+      // hits never throw the car into the air; gravity still pulls it down.
+      const vy = Math.min(0.6, Math.max(-30, v.y));
+      // Apply throttle horizontally only when grounded — when airborne the
+      // driver/AI input must not steer or push the car around mid-flight.
+      const grounded = vy <= 0.6 && vy >= -0.6;
+      const speed = grounded ? this.speed : 0;
+      this.body.setLinearVelocity(
+        new Vector3(grounded ? f.x * speed : v.x, vy, grounded ? f.z * speed : v.z)
+      );
       this.body.setAngularVelocity(Vector3.Zero());
     } else {
       this.root.position.x += f.x * this.speed * dt;

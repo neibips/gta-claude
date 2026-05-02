@@ -18,8 +18,10 @@ const badFetch = (status: number) =>
 describe('MapLoader', () => {
   it('loads and returns parsed map', async () => {
     const map = await MapLoader.load('assets/maps/city-map.json', okFetch(realMap));
-    expect(map.size.width).toBe(200);
-    expect(map.size.height).toBe(200);
+    expect(map.version).toBe(2);
+    expect(map.size.width).toBe(600);
+    expect(map.size.height).toBe(600);
+    expect(map.districts.map((d) => d.id).sort()).toEqual(['city', 'factory', 'field', 'village']);
   });
 
   it('throws MapLoadError when file missing (404)', async () => {
@@ -39,7 +41,7 @@ describe('MapLoader', () => {
   });
 
   it('throws on validation failure', async () => {
-    const broken = { ...realMap, version: 99 };
+    const broken = { ...realMap, version: 1 };
     await expect(MapLoader.load('assets/maps/city-map.json', okFetch(broken))).rejects.toThrow(
       /validation failed/
     );

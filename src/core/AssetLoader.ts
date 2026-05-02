@@ -6,15 +6,24 @@ import { LoadAssetContainerAsync } from '@babylonjs/core/Loading/sceneLoader';
 import '@babylonjs/loaders/glTF';
 import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh';
 import type { AnimationGroup } from '@babylonjs/core/Animations/animationGroup';
+import type { Node } from '@babylonjs/core/node';
+import type { TransformNode } from '@babylonjs/core/Meshes/transformNode';
+
+export type ModelRoot = AbstractMesh | TransformNode;
 
 export type LoadedModel = {
   meshes: AbstractMesh[];
   animationGroups: AnimationGroup[];
-  rootMesh: AbstractMesh;
+  /**
+   * The top-most node of the imported hierarchy. May be a TransformNode
+   * (glTF `__root__`) rather than a mesh. In Babylon 8+ the glTF loader no
+   * longer wraps the import in a Mesh, so we walk up from the first mesh.
+   */
+  rootMesh: ModelRoot;
 };
 
 export type AssetIndex = {
-  player: { rig: string; idle: string; walk: string; run: string };
+  player: { rig: string; idle: string; walk: string; run: string; punch: string; jump: string };
   npc: Array<{ name: string; rig: string; walk?: string; run?: string }>;
   policeman: { rig: string; walk: string; run: string };
   car: string[];
@@ -27,6 +36,8 @@ export const ASSET_INDEX: AssetIndex = {
     idle: 'assets/player/player_idle.glb',
     walk: 'assets/player/player_walking.glb',
     run: 'assets/player/player_running.glb',
+    punch: 'assets/player/player_punch.glb',
+    jump: 'assets/player/player_jump.glb',
   },
   npc: [
     {
@@ -73,6 +84,26 @@ export const ASSET_INDEX: AssetIndex = {
   },
 };
 
+function isModelRoot(node: Node | null | undefined): node is ModelRoot {
+  return !!node && 'position' in node && 'scaling' in node;
+}
+
+export function findImportedModelRoot(
+  meshes: readonly AbstractMesh[],
+  transformNodes: readonly TransformNode[]
+): ModelRoot {
+  const firstNode = meshes[0] ?? transformNodes[0];
+  if (!firstNode) {
+    throw new Error('Imported model contains no meshes or transform nodes');
+  }
+
+  let root: ModelRoot = firstNode;
+  while (isModelRoot(root.parent)) {
+    root = root.parent;
+  }
+  return root;
+}
+
 export class AssetLoader {
   constructor(private readonly scene: Scene) {
     SceneLoader.ShowLoadingScreen = false;
@@ -82,7 +113,7 @@ export class AssetLoader {
   async loadModel(url: string): Promise<LoadedModel> {
     const result = await ImportMeshAsync(url, this.scene);
     const meshes = result.meshes;
-    const root = meshes.find((m) => !m.parent) ?? meshes[0];
+    const root = findImportedModelRoot(meshes, result.transformNodes ?? []);
     return {
       meshes,
       animationGroups: result.animationGroups ?? [],

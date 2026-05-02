@@ -3,14 +3,23 @@ import type { Scene } from '@babylonjs/core/scene';
 import { Policeman } from '../entities/Policeman';
 import { GameConfig } from '../config/GameConfig';
 import type { Player } from '../entities/Player';
+import type { WaypointGraph, Waypoint } from '../world/WaypointGraph';
 
 const STAGGER_RADIUS = 6;
+
+type PatrolState = { wp: Waypoint | null; prevId: string | null };
 
 export class PoliceAISystem {
   /** Damage applied to player per shot (per policeman). */
   static readonly DAMAGE_PER_SHOT = 6;
 
-  constructor(private readonly scene: Scene, private readonly player: Player) {}
+  private patrol = new WeakMap<Policeman, PatrolState>();
+
+  constructor(
+    private readonly scene: Scene,
+    private readonly player: Player,
+    private readonly patrolGraph: WaypointGraph | null = null
+  ) {}
 
   /** Tick all police. */
   update(police: Policeman[], dt: number): void {
@@ -36,11 +45,28 @@ export class PoliceAISystem {
 
     switch (p.state) {
       case 'PATROL': {
-        // Wander toward player area until close enough.
-        if (distToPlayer < 30 && hasLOS) {
+        // Engage the player on sight or at close range; otherwise wander
+        // along the sidewalk waypoint graph at walking pace.
+        if (hasLOS && distToPlayer < GameConfig.police.losMaxRange) {
           p.setState('CHASE');
-        } else if (distToPlayer < 60) {
-          p.setState('CHASE');
+          break;
+        }
+        if (this.patrolGraph) {
+          let st = this.patrol.get(p);
+          if (!st) {
+            const start = this.patrolGraph.nearest(p.position());
+            st = { wp: start, prevId: null };
+            this.patrol.set(p, st);
+          }
+          if (!st.wp) st.wp = this.patrolGraph.nearest(p.position());
+          const target = st.wp.position;
+          p.playWalking();
+          const reached = p.moveTo(target, GameConfig.police.patrolSpeed, dt);
+          if (reached) {
+            const next = this.patrolGraph.next(st.wp, st.prevId);
+            st.prevId = st.wp.id;
+            st.wp = next;
+          }
         }
         break;
       }
@@ -108,12 +134,15 @@ export class PoliceAISystem {
       case 'ATTACK': {
         // Stand and shoot. Move only if no LOS.
         if (!hasLOS) {
+          p.setAiming(false);
           p.setState('CHASE');
           break;
         }
+        p.setAiming(true);
         p.faceTarget(playerPos, dt);
         if (p.canShoot(now) && !this.allyInLine(p, all, playerPos)) {
           p.scheduleNextShot(now);
+          p.playShootRecoil();
           p.onShootPlayer?.(PoliceAISystem.DAMAGE_PER_SHOT);
         }
         if (p.isStateExpired(now)) {

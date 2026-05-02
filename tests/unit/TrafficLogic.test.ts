@@ -2,7 +2,10 @@ import { describe, it, expect } from 'vitest';
 import {
   arcadeSpeedUpdate,
   headingTo,
+  isNpcLikeBlocker,
+  isRoadSurface,
   nextWaypoint,
+  shouldReverseForBlocker,
   type WaypointGraphLite,
 } from '../../src/systems/TrafficLogic';
 
@@ -60,5 +63,27 @@ describe('TrafficLogic.arcadeSpeedUpdate', () => {
     let s = 14;
     for (let i = 0; i < 200; i++) s = arcadeSpeedUpdate(s, 0, 0, 0.5, 14, 6, 30);
     expect(s).toBeCloseTo(0, 5);
+  });
+});
+
+describe('TrafficLogic blocker and road helpers', () => {
+  it('does not reverse away from NPC-like blockers', () => {
+    expect(isNpcLikeBlocker('npc')).toBe(true);
+    expect(isNpcLikeBlocker('police')).toBe(true);
+    expect(shouldReverseForBlocker('npc')).toBe(false);
+    expect(shouldReverseForBlocker('police')).toBe(false);
+  });
+
+  it('reverses away from hard blockers or unknown stuck collisions', () => {
+    expect(shouldReverseForBlocker('building')).toBe(true);
+    expect(shouldReverseForBlocker('vehicle')).toBe(true);
+    expect(shouldReverseForBlocker(null)).toBe(true);
+  });
+
+  it('recognizes GLB street mesh kinds as traffic road surfaces', () => {
+    expect(isRoadSurface('road')).toBe(true);
+    expect(isRoadSurface('sidewalk')).toBe(true);
+    expect(isRoadSurface('building')).toBe(false);
+    expect(isRoadSurface(null)).toBe(false);
   });
 });
